@@ -95,18 +95,19 @@ impl PathfinderUpdater {
     }
 }
 
-type GameUpdateFunction = dyn FnOnce(&mut Game) + Send + Sync;
+type GameUpdateFunction<T> = dyn FnOnce(&mut Game) -> T + Send + Sync;
 
-struct GameFuture {
+struct GameFuture<T> {
     state: Arc<Mutex<GameFutureState>>,
+    output: Arc<Mutex<Option<T>>>,
 }
 
-impl Future for GameFuture {
-    type Output = ();
+impl<T> Future for GameFuture<T> {
+    type Output = T;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut shared_state = self.state.lock().unwrap();
-        if shared_state.completed {
-            Poll::Ready(())
+        if let Some(output) = self.output.lock().unwrap().take() {
+            Poll::Ready(output)
         } else {
             shared_state.waker = Some(cx.waker().clone());
             Poll::Pending
@@ -115,9 +116,9 @@ impl Future for GameFuture {
 }
 
 struct GameFutureState {
-    completed: bool,
+    // completed: bool,
     waker: Option<Waker>,
-    function: Option<Box<GameUpdateFunction>>,
+    function: Option<Box<GameUpdateFunction<()>>>,
 }
 
 #[derive(Clone)]
@@ -126,17 +127,25 @@ struct GameUpdater {
 }
 
 impl GameUpdater {
-    fn update(&self, function: Box<GameUpdateFunction>) -> GameFuture {
+    fn update<T>(&self, function: Box<GameUpdateFunction<T>>) -> GameFuture<T>
+    where
+        T: Send + 'static,
+    {
+        let output = Arc::new(Mutex::new(None));
+        let output_2 = output.clone();
+        let function = move |game: &mut Game| {
+            let out = function(game);
+            *output_2.lock().unwrap() = Some(out);
+        };
         let state = GameFutureState {
-            completed: false,
             waker: None,
-            function: Some(function),
+            function: Some(Box::new(function)),
         };
         let state = Arc::new(Mutex::new(state));
 
         self.tx.send(state.clone()).unwrap();
 
-        GameFuture { state }
+        GameFuture { state, output }
     }
 }
 
@@ -164,10 +173,11 @@ impl GameEventConsumer {
                         pathfinder.paths
                     }))
                     .await;
-                game_updater
+                let extracted_usize = game_updater
                     .update(Box::new(move |game| {
                         game.counter = paths;
                         println!("Set counter to {}", game.counter);
+                        game.counter
                     }))
                     .await;
                 let paths = pathfinder_updater
@@ -176,10 +186,11 @@ impl GameEventConsumer {
                         pathfinder.paths
                     }))
                     .await;
-                game_updater
+                let extracted_string = game_updater
                     .update(Box::new(move |game| {
                         game.counter = paths;
                         println!("Set counter to {}", game.counter);
+                        "Test".to_string()
                     }))
                     .await;
                 *active.lock().unwrap() = false;
@@ -233,7 +244,6 @@ impl Game {
             let mut state = state.lock().unwrap();
             if let Some(function) = state.function.take() {
                 function(self);
-                state.completed = true;
                 if let Some(waker) = state.waker.take() {
                     waker.wake()
                 }
