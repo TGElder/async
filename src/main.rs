@@ -11,7 +11,7 @@ fn main() {
     Game::new().run();
 }
 
-type PathfinderFunction = dyn FnOnce(&Pathfinder) -> usize + Send + Sync;
+type PathfinderFunction = dyn FnOnce(&Pathfinder) -> usize + Send + Sync + 'static;
 
 struct Pathfinder {
     tx: SyncSender<Arc<Mutex<PathfinderFutureState>>>,
@@ -81,11 +81,14 @@ struct PathfinderUpdater {
 }
 
 impl PathfinderUpdater {
-    fn update(&self, function: Box<PathfinderFunction>) -> PathfinderFuture {
+    fn update<U>(&self, function: U) -> PathfinderFuture
+    where
+        U: FnOnce(&Pathfinder) -> usize + Send + Sync + 'static,
+    {
         let state = PathfinderFutureState {
             output: None,
             waker: None,
-            function: Some(function),
+            function: Some(Box::new(function)),
         };
         let state = Arc::new(Mutex::new(state));
 
@@ -95,7 +98,7 @@ impl PathfinderUpdater {
     }
 }
 
-type GameUpdateFunction<T> = dyn FnOnce(&mut Game) -> T + Send + Sync;
+type GameUpdateFunction<T> = dyn FnOnce(&mut Game) -> T + Send + Sync + 'static;
 
 struct GameFuture<T> {
     state: Arc<Mutex<GameFutureState>>,
@@ -127,9 +130,10 @@ struct GameUpdater {
 }
 
 impl GameUpdater {
-    fn update<T>(&self, function: Box<GameUpdateFunction<T>>) -> GameFuture<T>
+    fn update<T, U>(&self, function: U) -> GameFuture<T>
     where
         T: Send + 'static,
+        U: FnOnce(&mut Game) -> T + Send + Sync + 'static,
     {
         let output = Arc::new(Mutex::new(None));
         let output_2 = output.clone();
@@ -168,30 +172,30 @@ impl GameEventConsumer {
         thread::spawn(move || {
             block_on(async {
                 let paths = pathfinder_updater
-                    .update(Box::new(|pathfinder| {
+                    .update(|pathfinder| {
                         println!("Found path {}", pathfinder.paths);
                         pathfinder.paths
-                    }))
+                    })
                     .await;
                 let extracted_usize = game_updater
-                    .update(Box::new(move |game| {
+                    .update(move |game| {
                         game.counter = paths;
                         println!("Set counter to {}", game.counter);
                         game.counter
-                    }))
+                    })
                     .await;
                 let paths = pathfinder_updater
-                    .update(Box::new(|pathfinder| {
+                    .update(|pathfinder| {
                         println!("Found path {}", pathfinder.paths);
                         pathfinder.paths
-                    }))
+                    })
                     .await;
                 let extracted_string = game_updater
-                    .update(Box::new(move |game| {
+                    .update(move |game| {
                         game.counter = paths;
                         println!("Set counter to {}", game.counter);
                         "Test".to_string()
-                    }))
+                    })
                     .await;
                 *active.lock().unwrap() = false;
             })
